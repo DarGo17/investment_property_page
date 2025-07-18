@@ -1,3 +1,8 @@
+<<<<<<< HEAD
 numpy
 streamlit
 pandas
+=======
+streamlit
+numpy
+>>>>>>> 20dec8892d173571f57970a69091e547694b7b66
