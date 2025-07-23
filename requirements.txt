@@ -1,3 +1,7 @@
-numpy
 streamlit
 pandas
+numpy
+matplotlib
+prophet
+joblib
+requests
