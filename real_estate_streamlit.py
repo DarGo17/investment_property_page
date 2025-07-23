@@ -1,53 +1,107 @@
 import streamlit as st
+import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+from prophet import Prophet
+import joblib
+import requests
+from datetime import datetime
 
-st.title('Real Estate Investment Valuation Tool')
+# =================== Load Model and Data ==========================
+model = joblib.load('prophet_model.pkl')
+combined_df = joblib.load('combined_df.pkl')  # Should include Date, price, MORTGAGE30US
+forecast = model.predict(model.make_future_dataframe(periods=120, freq='M'))  # Generate full future forecast
 
-# User Inputs
-purchase_price = st.number_input('Purchase Price ($)', value=1000000)
-down_payment_percent = st.number_input('Down Payment (%)', min_value=0.0, max_value=100.0, value=20.0)
-interest_rate = st.number_input('Interest Rate (%)', min_value=0.0, max_value=20.0, value=6.5)
-loan_term_years = st.number_input('Loan Term (Years)', min_value=1, max_value=40, value=30)
-annual_rent_income = st.number_input('Annual Rental Income ($)', value=120000)
-annual_operating_expenses = st.number_input('Annual Operating Expenses ($)', value=40000)
+# =================== RentCast API Setup ==========================
+API_KEY = "bc87829e1d2d4ee68dcbb775c90b598a"
+VALUE_URL = "https://api.rentcast.io/v1/avm/value"
+HEADERS = {"X-Api-Key": API_KEY}
 
-payment_type = st.radio('Payment Type', ['Fully Amortized', 'Interest Only'])
-
-# Calculations
-down_payment = purchase_price * (down_payment_percent / 100)
-loan_amount = purchase_price - down_payment
-monthly_interest_rate = interest_rate / 100 / 12
-total_payments = loan_term_years * 12
-
-if payment_type == 'Fully Amortized':
-    if monthly_interest_rate == 0:
-        monthly_payment = loan_amount / total_payments
+def fetch_property_value(address):
+    params = {"address": address}
+    response = requests.get(VALUE_URL, headers=HEADERS, params=params)
+    if response.status_code == 200:
+        return response.json()
     else:
-        monthly_payment = loan_amount * (monthly_interest_rate * (1 + monthly_interest_rate)**total_payments) / ((1 + monthly_interest_rate)**total_payments - 1)
-else:
-    monthly_payment = loan_amount * monthly_interest_rate  # Interest only
+        st.error(f"Value API Error {response.status_code}: {response.text}")
+        return None
 
-annual_debt_service = monthly_payment * 12
-net_operating_income = annual_rent_income - annual_operating_expenses
-cash_flow_before_tax = net_operating_income - annual_debt_service
-monthly_cash_flow = cash_flow_before_tax / 12
-cash_on_cash_return = (cash_flow_before_tax / down_payment) * 100 if down_payment > 0 else np.nan
-cap_rate = (net_operating_income / purchase_price) * 100
+# =================== Streamlit UI ==========================
+st.set_page_config(page_title="Forecast vs RentCast Comparison", layout="wide")
+st.title("🏡 Address-Based Home Value vs Forecast Comparison")
 
-# Output
-st.header("Investment Summary")
-st.write(f"Loan Amount: ${loan_amount:,.2f}")
-st.write(f"Monthly Debt Payment ({payment_type}): ${monthly_payment:,.2f}")
-st.write(f"Annual Debt Service: ${annual_debt_service:,.2f}")
-st.write(f"Net Operating Income (NOI): ${net_operating_income:,.2f}")
-st.write(f"Annual Cash Flow Before Tax: ${cash_flow_before_tax:,.2f}")
+tab1, tab2 = st.tabs(["📈 Forecast Explorer", "🏷️ Address Comparison"])
 
+# =================== TAB 1: Prophet Forecast Viewer ==========================
+with tab1:
+    st.subheader("📉 Full Model Forecast Viewer")
+
+    months_to_predict = st.slider("Forecast Months Ahead", 1, 120, 12)
+    min_date = forecast['ds'].min()
+    max_date = forecast['ds'].max()
+    date_range = st.date_input("Select Date Range to View", [min_date, max_date])
+
+    start_date, end_date = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
+    forecast_filtered = forecast[(forecast['ds'] >= start_date) & (forecast['ds'] <= end_date)]
+
+    fig1, ax1 = plt.subplots(figsize=(12, 6))
+    ax1.plot(forecast_filtered['ds'], forecast_filtered['yhat'], label="Forecast")
+    ax1.fill_between(forecast_filtered['ds'], forecast_filtered['yhat_lower'], forecast_filtered['yhat_upper'],
+                     color='blue', alpha=0.2, label="Uncertainty")
+    ax1.set_title("Fayetteville Home Price Forecast")
+    ax1.set_xlabel("Date")
+    ax1.set_ylabel("Price ($)")
+    ax1.legend()
+    plt.xticks(rotation=45)
+    st.pyplot(fig1)
+
+# =================== TAB 2: Address Comparison ==========================
+with tab2:
+    st.subheader("📍 Compare Property Value with Forecast on Custom Date")
+
+    address = st.text_input("Enter Property Address", "3821 Hargis St, Austin, TX 78723")
+    forecast_min = forecast['ds'].min()
+    forecast_max = forecast['ds'].max()
+
+    date_input = st.date_input("Select Forecast Date", forecast_max, min_value=forecast_min, max_value=forecast_max)
+
+    if address and date_input:
+        value_data = fetch_property_value(address)
+
+        if value_data:
+            rentcast_price = value_data.get("price")
+            st.metric("🏷️ RentCast Estimated Value", f"${rentcast_price:,.0f}")
+
+            selected_date = pd.to_datetime(date_input)
+
+            # Find closest forecasted date
+            closest_row = forecast.iloc[(forecast['ds'] - selected_date).abs().argsort()[:1]]
+            model_price = closest_row['yhat'].values[0]
+            model_date = closest_row['ds'].values[0]
+
+            st.metric("📈 Forecasted Value on Selected Date", f"${model_price:,.0f}")
+            diff_pct = 100 * (rentcast_price - model_price) / model_price
+
+            if diff_pct > 0:
+                st.success(f"🏠 The property appears **overvalued** by {diff_pct:.2f}% compared to the model.")
+            else:
+                st.info(f"💸 The property appears **undervalued** by {abs(diff_pct):.2f}% compared to the model.")
+
+            # Plot forecast from selected date forward
+            st.markdown("### 🔮 Forecast from Selected Date")
+            filtered_forecast = forecast[forecast['ds'] >= selected_date]
+
+            fig2, ax2 = plt.subplots(figsize=(10, 4))
+            ax2.plot(filtered_forecast['ds'], filtered_forecast['yhat'], label="Forecast")
+            ax2.fill_between(filtered_forecast['ds'], filtered_forecast['yhat_lower'], filtered_forecast['yhat_upper'], color='blue', alpha=0.2)
+            ax2.axhline(y=rentcast_price, color='r', linestyle='--', label="RentCast Value")
+            ax2.set_xlabel("Date")
+            ax2.set_ylabel("Price ($)")
+            ax2.set_title("Forecast vs RentCast Value")
+            ax2.legend()
+            st.pyplot(fig2)
+
+# =================== Optional CSV Download ==========================
 st.markdown("---")
-st.subheader("Monthly Cash Flow")
-if monthly_cash_flow >= 0:
-    st.markdown(f"<h3 style='color:green;'>${monthly_cash_flow:,.2f} Positive Cash Flow</h3>", unsafe_allow_html=True)
-else:
-    st.markdown(f"<h3 style='color:red;'>${monthly_cash_flow:,.2f} Negative Cash Flow</h3>", unsafe_allow_html=True)
-
-st.write(f"Cap Rate: {cap_rate:.2f}%")
-st.write(f"Cash on Cash Return: {cash_on_cash_return:.2f}%")
+csv = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].to_csv(index=False)
+st.download_button(label="📥 Download Full Forecast CSV", data=csv, file_name='forecast.csv', mime='text/csv')
